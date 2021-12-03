@@ -113,13 +113,6 @@ struct lua_input *lua_config_create(struct flb_input_instance *ins,
         return NULL;
     }
 
-    lf->buffer = flb_sds_create_size(LUA_BUFFER_CHUNK);
-    if (!lf->buffer) {
-        flb_plg_error(lf->ins, "could not allocate decode buffer");
-        lua_config_destroy(lf);
-        return NULL;
-    }
-
     lf->l2c_types_num = 0;
     tmp = flb_input_get_property("type_int_key", ins);
     if (tmp) {
@@ -174,9 +167,6 @@ void lua_config_destroy(struct lua_input *lf)
 
     if (lf->script) {
         flb_sds_destroy(lf->script);
-    }
-    if (lf->buffer) {
-        flb_sds_destroy(lf->buffer);
     }
 
     mk_list_foreach_safe(head, tmp_list, &lf->l2c_types) {

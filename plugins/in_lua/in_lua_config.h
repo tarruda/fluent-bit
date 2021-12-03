@@ -43,10 +43,7 @@ struct l2c_type {
 struct lua_input {
     flb_sds_t script;                 /* lua script path */
     flb_sds_t call;                   /* function name   */
-    flb_sds_t buffer;                 /* json dec buffer */
     int    l2c_types_num;             /* number of l2c_types */
-    int    protected_mode;            /* exec lua function in protected mode */
-    int    time_as_table;             /* timestamp as a Lua table */
     struct mk_list l2c_types;         /* data types (lua -> C) */
     struct flb_luajit *lua;           /* state context   */
     struct flb_input_instance *ins;   /* input instance */
@@ -54,7 +51,7 @@ struct lua_input {
 };
 
 struct lua_input *lua_config_create(struct flb_input_instance *ins,
-                                     struct flb_config *config);
+                                    struct flb_config *config);
 void lua_config_destroy(struct lua_input *li);
 
 #endif
