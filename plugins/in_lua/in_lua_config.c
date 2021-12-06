@@ -33,7 +33,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-struct lua_input *lua_config_create(struct flb_input_instance *ins,
+struct lua_input *in_lua_config_create(struct flb_input_instance *ins,
                                     struct flb_config *config)
 {
     int ret;
@@ -109,7 +109,7 @@ struct lua_input *lua_config_create(struct flb_input_instance *ins,
 
     if (!lf->call) {
         flb_plg_error(lf->ins, "could not allocate call");
-        lua_config_destroy(lf);
+        in_lua_config_destroy(lf);
         return NULL;
     }
 
@@ -155,7 +155,7 @@ struct lua_input *lua_config_create(struct flb_input_instance *ins,
     return lf;
 }
 
-void lua_config_destroy(struct lua_input *lf)
+void in_lua_config_destroy(struct lua_input *lf)
 {
     struct mk_list  *tmp_list = NULL;
     struct mk_list  *head     = NULL;

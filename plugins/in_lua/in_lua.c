@@ -372,7 +372,7 @@ static int in_lua_init(struct flb_input_instance *in,
     struct flb_luajit *lj;
 
     /* Create context */
-    ctx = lua_config_create(in, config);
+    ctx = in_lua_config_create(in, config);
     if (!ctx) {
         flb_error("[in_lua] filter cannot be loaded");
         return -1;
@@ -381,7 +381,7 @@ static int in_lua_init(struct flb_input_instance *in,
     /* Create LuaJIT state/vm */
     lj = flb_luajit_create(config);
     if (!lj) {
-        lua_config_destroy(ctx);
+        in_lua_config_destroy(ctx);
         return -1;
     }
     ctx->lua = lj;
@@ -389,14 +389,14 @@ static int in_lua_init(struct flb_input_instance *in,
     /* Load Script */
     ret = flb_luajit_load_script(ctx->lua, ctx->script);
     if (ret == -1) {
-        lua_config_destroy(ctx);
+        in_lua_config_destroy(ctx);
         return -1;
     }
     lua_pcall(ctx->lua->state, 0, 0, 0);
 
     if (is_valid_func(ctx->lua->state, ctx->call) != FLB_TRUE) {
         flb_plg_error(ctx->ins, "function %s is not found", ctx->call);
-        lua_config_destroy(ctx);
+        in_lua_config_destroy(ctx);
         return -1;
     }
 
@@ -417,7 +417,7 @@ static int in_lua_exit(void *data, struct flb_config *config)
 
     ctx = data;
     flb_luajit_destroy(ctx->lua);
-    lua_config_destroy(ctx);
+    in_lua_config_destroy(ctx);
 
     return 0;
 }

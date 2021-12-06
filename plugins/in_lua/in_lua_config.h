@@ -50,8 +50,8 @@ struct lua_input {
     msgpack_sbuffer mp_sbuf;
 };
 
-struct lua_input *lua_config_create(struct flb_input_instance *ins,
+struct lua_input *in_lua_config_create(struct flb_input_instance *ins,
                                     struct flb_config *config);
-void lua_config_destroy(struct lua_input *li);
+void in_lua_config_destroy(struct lua_input *li);
 
 #endif
