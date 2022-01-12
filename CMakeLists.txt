@@ -123,6 +123,7 @@ option(FLB_IN_FORWARD         "Enable Forward input plugin"         Yes)
 option(FLB_IN_HEALTH          "Enable Health input plugin"          Yes)
 option(FLB_IN_HTTP            "Enable HTTP input plugin"            Yes)
 option(FLB_IN_MEM             "Enable Memory input plugin"          Yes)
+option(FLB_IN_KAFKA           "Enable Kafka input plugin"           No)
 option(FLB_IN_KMSG            "Enable Kernel log input plugin"      Yes)
 option(FLB_IN_LIB             "Enable library mode input plugin"    Yes)
 option(FLB_IN_RANDOM          "Enable random input plugin"          Yes)
@@ -728,6 +729,18 @@ if(FLB_BACKTRACE)
   set_target_properties(libbacktrace PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/backtrace-prefix/lib/libbacktrace.a")
   add_dependencies(libbacktrace backtrace)
   include_directories("${CMAKE_CURRENT_BINARY_DIR}/backtrace-prefix/include/")
+endif()
+
+if(FLB_IN_KAFKA OR FLB_OUT_KAFKA)
+    FLB_OPTION(RDKAFKA_BUILD_STATIC    On)
+    FLB_OPTION(RDKAFKA_BUILD_EXAMPLES Off)
+    FLB_OPTION(RDKAFKA_BUILD_TESTS    Off)
+    FLB_OPTION(ENABLE_LZ4_EXT         Off)
+
+    add_subdirectory(lib/librdkafka-1.7.0 EXCLUDE_FROM_ALL)
+
+    # librdkafka headers
+    include_directories(lib/librdkafka-1.7.0/src/)
 endif()
 
 # Onigmo (Regex Engine)
