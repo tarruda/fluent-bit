@@ -1,0 +1,25 @@
+{
+  "fields": [
+    {
+      "name": "metadata",
+      "type": "bytes"
+    },
+    {
+      "name": "avro_schema",
+      "type": "string"
+    },
+    {
+      "name": "max_size",
+      "type": "int"
+    },
+    {
+      "name": "payload",
+      "type": {
+        "type": "array",
+        "items": "bytes"
+      }
+    }
+  ],
+  "name": "LogEvent",
+  "type": "record"
+}

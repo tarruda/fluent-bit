@@ -1,0 +1,44 @@
+{ "wd_service":REQUIRED,
+  "wd_owner":REQUIRED,
+  "wd_datatype":REQUIRED,
+  "wd_dataobject":REQUIRED,
+  "wd_solas":REQUIRED,
+  "wd_service_instance":REQUIRED,
+  "avro_schema": {
+  "type": "record",
+  "name": "test_stats",
+  "namespace": "com.workday.pharos.stats",
+  "version": 1,
+  "fields": [
+    {
+      "name": "time",
+      "type": {"type": "string", "logicalType": "timestamp"}
+    },
+    { 
+      "name": "flag", 
+      "type": "boolean",
+      "default": "false", 
+      "doc": "Some flag"
+    },
+    {
+      "name": "customer",
+      "type": ["null", "string"], 
+      "default": null,
+      "doc": "Tenant name"
+    },
+    {
+      "name": "process_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Process Id"
+    },
+  
+    {
+      "name": "task_duration",
+      "type": ["null", "long"],
+      "default": null,
+      "doc": "Task Duration"
+    }
+  ]
+  }
+}

@@ -134,6 +134,10 @@ static int in_exec_collect(struct flb_input_instance *ins,
         pclose(cmdp);
     }
 
+    if (ctx->oneshot) {
+        flb_engine_exit(config);
+    }
+
     return ret;
 }
 
