@@ -41,6 +41,7 @@
 #include <assert.h>
 #include <errno.h>
 
+#include "fluent-bit/flb_task.h"
 #include "http.h"
 #include "http_conf.h"
 
@@ -342,9 +343,10 @@ static int http_gelf(struct flb_out_http *ctx,
     return ret;
 }
 
-static int extract_body_key(const char *data, size_t size,
-                            flb_sds_t body_key,
-                            const char **out_body, size_t *out_size)
+static int post_all_requests(struct flb_out_http *ctx,
+                             const char *data, size_t size,
+                             flb_sds_t body_key,
+                             struct flb_event_chunk *event_chunk)
 {
     int ret;
     struct flb_time t;
@@ -352,12 +354,16 @@ static int extract_body_key(const char *data, size_t size,
     mpack_reader_t reader;
     size_t key_count;
     size_t i;
-    bool key_found;
     size_t len;
+    const char *body;
+    size_t body_size;
+    bool body_found;
+    int record_count = 0;
 
     mpack_reader_init_data(&reader, data, size);
 
     while (size > 0) {
+        body_found = false;
         const char *record_start = reader.data;
         size_t record_size = 0;
 
@@ -380,18 +386,20 @@ static int extract_body_key(const char *data, size_t size,
             }
 
             len = mpack_tag_bytes(&mtag);
-            key_found = len == flb_sds_len(body_key) &&
-                !memcmp(reader.data, body_key, len);
+            body_found = body_found || (len == flb_sds_len(body_key) &&
+                !memcmp(reader.data, body_key, len));
             reader.data += len;
             mtag = mpack_read_tag(&reader);
             if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
                 return -1;
             }
             len = mpack_tag_bytes(&mtag);
-            if (key_found) {
-                *out_size = len;
-                *out_body = reader.data;
-                return 0;
+            if (body_found) {
+                body_size = len;
+                body = reader.data;
+                ret = http_post(ctx, body, body_size, event_chunk->tag,
+                        flb_sds_len(event_chunk->tag));
+                flb_plg_trace(ctx->ins, "posting record %d", record_count++);
             }
             reader.data += len;
         }
@@ -400,7 +408,7 @@ static int extract_body_key(const char *data, size_t size,
         size -= record_size;
     }
 
-    return -1;
+    return ret;
 }
 
 static void cb_http_flush(struct flb_event_chunk *event_chunk,
@@ -413,19 +421,13 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
     flb_sds_t json;
     struct flb_out_http *ctx = out_context;
     (void) i_ins;
-    const char *body;
-    size_t body_size;
 
     if (ctx->body_key) {
-        ret = extract_body_key(event_chunk->data, event_chunk->size,
-                               ctx->body_key, &body, &body_size);
-        if (ret) {
+        ret = post_all_requests(ctx, event_chunk->data, event_chunk->size,
+                                ctx->body_key, event_chunk);
+        if (ret < 0) {
             flb_plg_error(ctx->ins,
-                          "failed to extract body key \"%s\"", ctx->body_key);
-        }
-        else {
-            ret = http_post(ctx, body, body_size,
-                    event_chunk->tag, flb_sds_len(event_chunk->tag));
+                          "failed to post requests body key \"%s\"", ctx->body_key);
         }
     }
     else if ((ctx->out_format == FLB_PACK_JSON_FORMAT_JSON) ||
