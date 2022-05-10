@@ -72,7 +72,8 @@ static int cb_http_init(struct flb_output_instance *ins,
 
 static int http_post(struct flb_out_http *ctx,
                      const void *body, size_t body_len,
-                     const char *tag, int tag_len)
+                     const char *tag, int tag_len,
+                     char **headers)
 {
     int ret;
     int out_ret = FLB_OK;
@@ -88,6 +89,9 @@ static int http_post(struct flb_out_http *ctx,
     struct flb_slist_entry *key = NULL;
     struct flb_slist_entry *val = NULL;
     flb_sds_t signature = NULL;
+    int i;
+    char *header_key;
+    char *header_value;
 
     /* Get upstream context and connection */
     u = ctx->u;
@@ -137,12 +141,30 @@ static int http_post(struct flb_out_http *ctx,
     c->cb_ctx = ctx->ins->callback;
 
     /* Append headers */
-    if (ctx->content_type) {
-        flb_http_add_header(c,
-                            FLB_HTTP_CONTENT_TYPE,
-                            sizeof(FLB_HTTP_CONTENT_TYPE) - 1,
-                            ctx->content_type,
-                            flb_sds_len(ctx->content_type));
+    if (headers) {
+        i = 0;
+        header_key = NULL;
+        header_value = NULL;
+        while (*headers) {
+            if (i % 2 == 0) {
+                header_key = *headers;
+            } else {
+                header_value = *headers;
+            }
+            if (header_key && header_value) {
+                flb_http_add_header(c,
+                        header_key,
+                        strlen(header_key),
+                        header_value,
+                        strlen(header_value));
+                flb_free(header_key);
+                flb_free(header_value);
+                header_key = NULL;
+                header_value = NULL;
+            }
+            headers++;
+            i++;
+        }
     }
     else if ((ctx->out_format == FLB_PACK_JSON_FORMAT_JSON) ||
         (ctx->out_format == FLB_PACK_JSON_FORMAT_STREAM) ||
@@ -336,7 +358,7 @@ static int http_gelf(struct flb_out_http *ctx,
         s = tmp;
     }
 
-    ret = http_post(ctx, s, flb_sds_len(s), tag, tag_len);
+    ret = http_post(ctx, s, flb_sds_len(s), tag, tag_len, NULL);
     flb_sds_destroy(s);
     msgpack_unpacked_destroy(&result);
 
@@ -358,14 +380,21 @@ static int post_all_requests(struct flb_out_http *ctx,
     const char *body;
     size_t body_size;
     bool body_found;
+    char **headers;
+    const char *record_start;
+    size_t record_size;
     int record_count = 0;
 
     mpack_reader_init_data(&reader, data, size);
 
     while (size > 0) {
         body_found = false;
-        const char *record_start = reader.data;
-        size_t record_size = 0;
+        record_start = reader.data;
+        record_size = 0;
+        headers = flb_calloc(3, sizeof *headers);
+        headers[0] = strdup("content-type");
+        headers[1] = strdup("application/avro");
+        headers[2] = NULL;
 
         ret = flb_time_pop_from_mpack(&t, &reader);
         if (ret) {
@@ -398,7 +427,7 @@ static int post_all_requests(struct flb_out_http *ctx,
                 body_size = len;
                 body = reader.data;
                 ret = http_post(ctx, body, body_size, event_chunk->tag,
-                        flb_sds_len(event_chunk->tag));
+                        flb_sds_len(event_chunk->tag), headers);
                 flb_plg_trace(ctx->ins, "posting record %d", record_count++);
             }
             reader.data += len;
@@ -406,6 +435,7 @@ static int post_all_requests(struct flb_out_http *ctx,
 
         record_size = reader.data - record_start;
         size -= record_size;
+        flb_free(headers);
     }
 
     return ret;
@@ -441,7 +471,7 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
                                                ctx->date_key);
         if (json != NULL) {
             ret = http_post(ctx, json, flb_sds_len(json),
-                            event_chunk->tag, flb_sds_len(event_chunk->tag));
+                            event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
             flb_sds_destroy(json);
         }
     }
@@ -453,7 +483,7 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
     else {
         ret = http_post(ctx,
                         event_chunk->data, event_chunk->size,
-                        event_chunk->tag, flb_sds_len(event_chunk->tag));
+                        event_chunk->tag, flb_sds_len(event_chunk->tag), NULL);
     }
 
     FLB_OUTPUT_RETURN(ret);
@@ -577,9 +607,9 @@ static struct flb_config_map config_map[] = {
      "Specify the key which contains the body"
     },
     {
-     FLB_CONFIG_MAP_STR, "content_type", NULL,
-     0, FLB_TRUE, offsetof(struct flb_out_http, content_type),
-     "Override Content-Type HTTP header"
+     FLB_CONFIG_MAP_STR, "headers_key", NULL,
+     0, FLB_TRUE, offsetof(struct flb_out_http, headers_key),
+     "Specify the key which contains the body"
     },
 
     /* EOF */
