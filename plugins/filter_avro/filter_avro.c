@@ -89,6 +89,23 @@ static const char meta_schema[] =
 "  ]"
 "}";
 
+/* these values come first from the fluent-bit record,
+ * and if not present fall back to environment variables.
+ * default value is an empty string */
+struct record_metadata {
+    char *wd_platform;
+    char *wd_env_physical;
+    char *wd_dc_physical;
+    char *wd_env_logical;
+    char *wd_service;
+    char *wd_owner;
+    char *wd_datatype;
+    char *wd_objectname;
+    char *wd_solas;
+    char *swh_server;
+    char *wd_service_instance;
+};
+
 static int create_avro_schemas(struct filter_avro *ctx)
 {
     char hostname[256];
@@ -695,6 +712,9 @@ static int write_avro_value(
     return 0;
 }
 
+static int populate_record_metadata(struct record_metadata *metadata)
+{
+}
 
 static int metadata_to_avro(
         struct filter_avro *ctx,
