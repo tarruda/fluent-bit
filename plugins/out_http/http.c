@@ -36,14 +36,17 @@
 #endif
 #endif
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 #include <errno.h>
 
 #include "fluent-bit/flb_task.h"
 #include "http.h"
 #include "http_conf.h"
+#include "mpack/mpack.h"
 
 #include <fluent-bit/flb_callback.h>
 
@@ -365,9 +368,68 @@ static int http_gelf(struct flb_out_http *ctx,
     return ret;
 }
 
+static char **extract_headers(mpack_reader_t *reader) {
+    mpack_tag_t mtag;
+    size_t key_count;
+    size_t i;
+    size_t len;
+    char **headers = NULL;
+    size_t str_count;
+
+    mtag = mpack_read_tag(reader);
+    if (mtag.type != mpack_type_map) {
+        goto err;
+    }
+
+    key_count = mpack_tag_map_count(&mtag);
+    if (!key_count) {
+        goto err;
+    }
+
+
+    str_count = key_count * 2 + 1;
+    headers = flb_calloc(str_count, sizeof *headers);
+
+    for (i = 0; i < key_count; i++) {
+        mtag = mpack_read_tag(reader);
+        if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
+            goto err;
+        }
+
+        len = mpack_tag_bytes(&mtag);
+        headers[i * 2] = strndup(reader->data, len);
+
+        if (!headers[i]) {
+            goto err;
+        }
+
+        reader->data += len;
+        mtag = mpack_read_tag(reader);
+        if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
+            goto err;
+        }
+
+        len = mpack_tag_bytes(&mtag);
+        headers[i * 2 + 1] = strndup(reader->data, len);
+
+        if (!headers[i]) {
+            goto err;
+        }
+
+        reader->data += len;
+    }
+
+    headers[str_count - 1] = NULL;
+    return headers;
+
+err:
+    return NULL;
+}
+
 static int post_all_requests(struct flb_out_http *ctx,
                              const char *data, size_t size,
                              flb_sds_t body_key,
+                             flb_sds_t headers_key,
                              struct flb_event_chunk *event_chunk)
 {
     int ret;
@@ -380,6 +442,9 @@ static int post_all_requests(struct flb_out_http *ctx,
     const char *body;
     size_t body_size;
     bool body_found;
+    bool is_body;
+    bool headers_found;
+    bool is_headers;
     char **headers;
     const char *record_start;
     size_t record_size;
@@ -388,13 +453,11 @@ static int post_all_requests(struct flb_out_http *ctx,
     mpack_reader_init_data(&reader, data, size);
 
     while (size > 0) {
+        headers = NULL;
         body_found = false;
+        headers_found = false;
         record_start = reader.data;
         record_size = 0;
-        headers = flb_calloc(3, sizeof *headers);
-        headers[0] = strdup("content-type");
-        headers[1] = strdup("application/avro");
-        headers[2] = NULL;
 
         ret = flb_time_pop_from_mpack(&t, &reader);
         if (ret) {
@@ -409,28 +472,47 @@ static int post_all_requests(struct flb_out_http *ctx,
         key_count = mpack_tag_map_count(&mtag);
 
         for (i = 0; i < key_count; i++) {
+            is_body = false;
+            is_headers = false;
             mtag = mpack_read_tag(&reader);
             if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
                 return -1;
             }
 
             len = mpack_tag_bytes(&mtag);
-            body_found = body_found || (len == flb_sds_len(body_key) &&
-                !memcmp(reader.data, body_key, len));
+            is_body = len == flb_sds_len(body_key) &&
+                !memcmp(reader.data, body_key, len);
+            is_headers = headers_key && len == flb_sds_len(headers_key) &&
+                !memcmp(reader.data, headers_key, len);
             reader.data += len;
-            mtag = mpack_read_tag(&reader);
-            if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
-                return -1;
-            }
-            len = mpack_tag_bytes(&mtag);
-            if (body_found) {
+            if (is_body) {
+                mtag = mpack_read_tag(&reader);
+                if (mtag.type != mpack_type_str && mtag.type != mpack_type_bin) {
+                    flb_plg_error(ctx->ins,
+                            "body key \"%s\" is not of the correct type",
+                            ctx->body_key);
+                    return -1;
+                }
+                len = mpack_tag_bytes(&mtag);
                 body_size = len;
                 body = reader.data;
+                reader.data += len;
+                body_found = true;
+            } else if (is_headers) {
+                headers = extract_headers(&reader);
+                if (!headers) {
+                    flb_plg_error(ctx->ins,
+                            "failed to extract headers from key \"%s\"",
+                            ctx->headers_key);
+                    return -1;
+                }
+                headers_found = true;
+            }
+            if (body_found && (!headers_key || headers_found)) {
                 ret = http_post(ctx, body, body_size, event_chunk->tag,
                         flb_sds_len(event_chunk->tag), headers);
                 flb_plg_trace(ctx->ins, "posting record %d", record_count++);
             }
-            reader.data += len;
         }
 
         record_size = reader.data - record_start;
@@ -452,9 +534,9 @@ static void cb_http_flush(struct flb_event_chunk *event_chunk,
     struct flb_out_http *ctx = out_context;
     (void) i_ins;
 
-    if (ctx->body_key) {
+    if (ctx->body_key || ctx->headers_key) {
         ret = post_all_requests(ctx, event_chunk->data, event_chunk->size,
-                                ctx->body_key, event_chunk);
+                                ctx->body_key, ctx->headers_key, event_chunk);
         if (ret < 0) {
             flb_plg_error(ctx->ins,
                           "failed to post requests body key \"%s\"", ctx->body_key);
