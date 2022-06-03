@@ -22,6 +22,7 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_kv.h>
+#include <fluent-bit/flb_record_accessor.h>
 #ifdef FLB_HAVE_SIGNV4
 #ifdef FLB_HAVE_AWS
 #include <fluent-bit/flb_aws_credentials.h>
@@ -67,6 +68,20 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
 
     if (ctx->body_key && !ctx->headers_key) {
         flb_plg_error(ctx->ins, "when setting body_key, headers_key is also required");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    ctx->body_ra = flb_ra_create(ctx->body_key, FLB_FALSE);
+    if (!ctx->body_ra) {
+        flb_plg_error(ctx->ins, "failed to allocate body record accessor");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    ctx->headers_ra = flb_ra_create(ctx->headers_key, FLB_FALSE);
+    if (!ctx->headers_ra) {
+        flb_plg_error(ctx->ins, "failed to allocate headers record accessor");
         flb_free(ctx);
         return NULL;
     }
@@ -257,6 +272,9 @@ void flb_http_conf_destroy(struct flb_out_http *ctx)
     if (!ctx) {
         return;
     }
+
+    flb_ra_destroy(ctx->body_ra);
+    flb_ra_destroy(ctx->headers_ra);
 
     if (ctx->u) {
         flb_upstream_destroy(ctx->u);
