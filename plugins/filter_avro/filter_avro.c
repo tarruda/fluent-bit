@@ -660,7 +660,7 @@ static void write_avro_field(void *data, const char *field, size_t field_len)
             debug ? &field_name : NULL);
 
     if (ret) {
-        flb_error("failed to get avro field index %zu", state->record_field_index);
+        // flb_error("failed to get avro field index %zu", state->record_field_index);
         goto end;
     }
 

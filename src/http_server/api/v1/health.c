@@ -17,17 +17,20 @@
  *  limitations under the License.
  */
 
-#include<stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_macros.h>
+#include <fluent-bit/flb_metrics.h>
 #include <fluent-bit/flb_http_server.h>
 #include <msgpack.h>
 
+#include "cmetrics/cmt_metric.h"
 #include "health.h"
+#include "metrics.h"
 
 struct flb_health_check_metrics_counter *metrics_counter;
 
@@ -297,14 +300,106 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
     mk_list_add(&buf->_head, metrics_list);
 }
 
+static bool contains_str(char **items, msgpack_object_str name)
+{
+    int i;
+
+    for (i = 0; items[i]; i++) {
+        if (!strncmp(name.ptr, items[i], name.size)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void get_in_out_records(char **input_plugins,
+                               char **output_plugins,
+                               uint64_t *in_records,
+                               uint64_t *out_records)
+{
+    int i, j, m;
+    struct flb_hs_buf *buf;
+    msgpack_unpacked result;
+    msgpack_object map;
+    uint64_t in_total = 0;
+    uint64_t out_total = 0;
+    size_t off = 0;
+
+    buf = metrics_get_latest();
+    if (!buf) {
+        goto end;
+    }
+
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf->raw_data, buf->raw_size, &off);
+    map = result.data;
+
+    for (i = 0; i < map.via.map.size; i++) {
+        msgpack_object k;
+        msgpack_object v;
+
+        /* Keys: input, output */
+        k = map.via.map.ptr[i].key;
+        v = map.via.map.ptr[i].val;
+
+        /* Iterate sub-map */
+        for (j = 0; j < v.via.map.size; j++) {
+            msgpack_object sk;
+            msgpack_object sv;
+
+            /* Keys: plugin name , values: metrics */
+            sk = v.via.map.ptr[j].key;
+            sv = v.via.map.ptr[j].val;
+
+            for (m = 0; m < sv.via.map.size; m++) {
+                msgpack_object mk;
+                msgpack_object mv;
+
+                mk = sv.via.map.ptr[m].key;
+                mv = sv.via.map.ptr[m].val;
+
+                if (!strncmp(k.via.str.ptr, "input", k.via.str.size) &&
+                    !strncmp(mk.via.str.ptr, "records", mk.via.str.size) &&
+                    contains_str(input_plugins, sk.via.str)) {
+                    in_total += mv.via.u64;
+                }
+
+                if (!strncmp(k.via.str.ptr, "output", k.via.str.size) &&
+                    !strncmp(mk.via.str.ptr, "proc_records", mk.via.str.size) &&
+                    contains_str(output_plugins, sk.via.str)) {
+                    out_total += mv.via.u64;
+                }
+            }
+        }
+    }
+
+    msgpack_unpacked_destroy(&result);
+
+end:
+    *in_records = in_total;
+    *out_records = out_total;
+}
+
 /* API: Get fluent Bit Health Status */
 static void cb_health(mk_request_t *request, void *data)
 {
+    char buf[256];
+    uint64_t in_records, out_records;
     int status = is_healthy();
+    char *input_plugins[] = {"tail.0", NULL};
+    char *output_plugins[] = {"null.0", NULL};
+
+    get_in_out_records(input_plugins,
+                       output_plugins,
+                       &in_records,
+                       &out_records);
+
+    snprintf(buf, sizeof(buf), "in_records: %" PRIu64 "\nout_records: %" PRIu64 "\nok\n", in_records, out_records);
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
-       mk_http_send(request, "ok\n", strlen("ok\n"), NULL);
+       mk_http_send(request, buf, strlen(buf), NULL);
        mk_http_done(request);
     }
     else {
