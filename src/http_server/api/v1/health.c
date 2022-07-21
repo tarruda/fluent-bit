@@ -419,29 +419,33 @@ static void hs_throughput_key_destroy(void *data)
     flb_free(sample_list);
 }
 
-static void get_record_rate(uint64_t *input_rate, uint64_t *output_rate) {
+static int is_throughput_healthy(char **input_plugins,
+                                 char **output_plugins,
+                                 int sample_count,
+                                 double out_in_ratio_threshold) {
     struct flb_time tp;
     uint64_t timestamp_seconds;
     uint64_t in_records;
     uint64_t out_records;
+    uint64_t in_rate;
+    uint64_t out_rate;
     struct mk_list *sample_list;
     struct mk_list *tmp;
     struct mk_list *head;
+    double out_in_ratio;
     struct flb_hs_throughput_sample *entry;
+    struct flb_hs_throughput_sample *prev;
     struct flb_hs_throughput_sample *sample;
     struct flb_hs_throughput_sample *last_sample = NULL;
-
-    *input_rate = 0;
-    *output_rate = 0;
-
-    char *input_plugins[] = {"tail.0", NULL};
-    char *output_plugins[] = {"null.0", NULL};
+    bool healthy;
+    bool rv;
 
     sample_list = pthread_getspecific(hs_throughput_key);
     if (sample_list == NULL) {
         sample_list = hs_throughput_key_create();
         if (sample_list == NULL) {
-            return;
+            flb_warn("[api/v1/health throughput]: failed to create throughput key");
+            return true;
         }
     }
 
@@ -452,9 +456,10 @@ static void get_record_rate(uint64_t *input_rate, uint64_t *output_rate) {
         last_sample = mk_list_entry_last(sample_list,
                                          struct flb_hs_throughput_sample,
                                          _head);
-        if (timestamp_seconds - last_sample->timestamp_seconds < 5) {
-            /* don't do anything unless at least 5 seconds have passed */
-            return;
+        if (timestamp_seconds - last_sample->timestamp_seconds < 1) {
+            flb_debug("[api/v1/health throughput]: less than 1 second passed");
+            /* don't do anything unless at least 1 second have passed */
+            return true;
         }
     }
 
@@ -466,9 +471,10 @@ static void get_record_rate(uint64_t *input_rate, uint64_t *output_rate) {
     if (last_sample &&
         in_records == last_sample->in_records &&
         out_records == last_sample->out_records) {
+        flb_debug("[api/v1/health throughput]: no changes since last check");
         /* don't collect another sample unless either in_records or out_records have
          * changed*/
-        return;
+        return true;
     }
 
     sample = flb_malloc(sizeof(struct flb_hs_throughput_sample));
@@ -477,43 +483,69 @@ static void get_record_rate(uint64_t *input_rate, uint64_t *output_rate) {
     sample->out_records = out_records;
     mk_list_add(&sample->_head, sample_list);
 
-    fprintf(stderr, "IN_RECORDS: %"PRIu64"\nOUT_RECORDS RATE: %" PRIu64 "\nTIMESTAMP: %"PRIu64"\n", in_records, out_records, timestamp_seconds);
-
-    if (last_sample) {
-        *input_rate = (sample->in_records - last_sample->in_records) /
-            (sample->timestamp_seconds - last_sample->timestamp_seconds);
-        *output_rate = (sample->out_records - last_sample->out_records) /
-            (sample->timestamp_seconds - last_sample->timestamp_seconds);
-    }
-
-    // /* check record rate of the last 5 samples */
-    int count = 0;
-    mk_list_foreach_safe(head, tmp, sample_list) {
-        count++;
+    flb_debug("[api/v1/health throughput]: check samples start %d %f",
+              sample_count,
+              out_in_ratio_threshold);
+    healthy = false;
+    mk_list_foreach_safe_r(head, tmp, sample_list) {
         entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
-        if (count > 3) {
-            mk_list_del(&entry->_head);
-            flb_free(entry);
+        if (entry == mk_list_entry_first(sample_list,
+                                         struct flb_hs_throughput_sample,
+                                         _head)) {
+            break;
+        }
+
+        prev = mk_list_entry(entry->_head.prev,
+                             struct flb_hs_throughput_sample,
+                             _head);
+        in_rate = (entry->in_records - prev->in_records) /
+            (entry->timestamp_seconds - prev->timestamp_seconds);
+        out_rate = (entry->out_records - prev->out_records) /
+            (entry->timestamp_seconds - prev->timestamp_seconds);
+        out_in_ratio = (double)out_rate / (double)in_rate;
+        healthy = healthy || out_in_ratio > out_in_ratio_threshold;
+
+        flb_debug("[api/v1/health throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
+                  out_in_ratio,
+                  out_rate,
+                  in_rate);
+        if (healthy) {
+            break;
         }
     }
 
-    fprintf(stderr, "SAMPLE COUNT: %d\n", mk_list_size(sample_list));
+    int count = 0;
+    mk_list_foreach_safe_r(head, tmp, sample_list) {
+        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
+        if (count == sample_count) {
+            mk_list_del(&entry->_head);
+            flb_free(entry);
+        } else {
+            count++;
+        }
+    }
+
+    rv = count < sample_count || healthy;
+    flb_debug("checking throughput samples stop, result: %s",
+              rv ? "healthy" :"unhealthy");
+
+    return rv;
 }
 
 /* API: Get fluent Bit Health Status */
 static void cb_health(mk_request_t *request, void *data)
 {
-    char buf[256];
-    int status = is_healthy();
-    uint64_t input_rate, output_rate;
-
-    get_record_rate(&input_rate, &output_rate);
-
-    snprintf(buf, sizeof(buf), "input_rate: %"PRIu64"\noutput rate: %" PRIu64 "\nok\n", input_rate, output_rate);
+    char *input_plugins[] = {"tail.0", NULL};
+    char *output_plugins[] = {"null.0", NULL};
+    int status = is_healthy() &&
+                 is_throughput_healthy(input_plugins,
+                                       output_plugins,
+                                       5,
+                                       0.1);
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
-       mk_http_send(request, buf, strlen(buf), NULL);
+       mk_http_send(request, "ok\n", strlen("ok\n"), NULL);
        mk_http_done(request);
     }
     else {
