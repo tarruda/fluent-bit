@@ -31,10 +31,12 @@
 #include "cmetrics/cmt_metric.h"
 #include "health.h"
 #include "metrics.h"
+#include "mk_core/mk_list.h"
 
 struct flb_health_check_metrics_counter *metrics_counter;
 
 pthread_key_t hs_health_key;
+pthread_key_t hs_throughput_key;
 
 static struct mk_list *hs_health_key_create()
 {
@@ -381,21 +383,133 @@ end:
     *out_records = out_total;
 }
 
-/* API: Get fluent Bit Health Status */
-static void cb_health(mk_request_t *request, void *data)
+static struct mk_list *hs_throughput_key_create()
 {
-    char buf[256];
-    uint64_t in_records, out_records;
-    int status = is_healthy();
+    struct mk_list *sample_list = NULL;
+
+    sample_list = flb_malloc(sizeof(struct mk_list));
+    if (!sample_list) {
+        flb_errno();
+        return NULL;
+    }
+    mk_list_init(sample_list);
+    pthread_setspecific(hs_throughput_key, sample_list);
+
+    return sample_list;
+}
+
+static void hs_throughput_key_destroy(void *data)
+{
+    struct mk_list *sample_list = (struct mk_list*)data;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct flb_hs_throughput_sample *entry;
+
+    if (sample_list == NULL) {
+        return;
+    }
+    mk_list_foreach_safe(head, tmp, sample_list) {
+        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
+        if (entry != NULL) {
+            mk_list_del(&entry->_head);
+            flb_free(entry);
+        }
+    }
+
+    flb_free(sample_list);
+}
+
+static void get_record_rate(uint64_t *input_rate, uint64_t *output_rate) {
+    struct flb_time tp;
+    uint64_t timestamp_seconds;
+    uint64_t in_records;
+    uint64_t out_records;
+    struct mk_list *sample_list;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct flb_hs_throughput_sample *entry;
+    struct flb_hs_throughput_sample *sample;
+    struct flb_hs_throughput_sample *last_sample = NULL;
+
+    *input_rate = 0;
+    *output_rate = 0;
+
     char *input_plugins[] = {"tail.0", NULL};
     char *output_plugins[] = {"null.0", NULL};
+
+    sample_list = pthread_getspecific(hs_throughput_key);
+    if (sample_list == NULL) {
+        sample_list = hs_throughput_key_create();
+        if (sample_list == NULL) {
+            return;
+        }
+    }
+
+    flb_time_get(&tp);
+    timestamp_seconds = flb_time_to_nanosec(&tp) / 1000000000;
+
+    if (mk_list_is_empty(sample_list) != 0) {
+        last_sample = mk_list_entry_last(sample_list,
+                                         struct flb_hs_throughput_sample,
+                                         _head);
+        if (timestamp_seconds - last_sample->timestamp_seconds < 5) {
+            /* don't do anything unless at least 5 seconds have passed */
+            return;
+        }
+    }
 
     get_in_out_records(input_plugins,
                        output_plugins,
                        &in_records,
                        &out_records);
 
-    snprintf(buf, sizeof(buf), "in_records: %" PRIu64 "\nout_records: %" PRIu64 "\nok\n", in_records, out_records);
+    if (last_sample &&
+        in_records == last_sample->in_records &&
+        out_records == last_sample->out_records) {
+        /* don't collect another sample unless either in_records or out_records have
+         * changed*/
+        return;
+    }
+
+    sample = flb_malloc(sizeof(struct flb_hs_throughput_sample));
+    sample->timestamp_seconds = timestamp_seconds;
+    sample->in_records = in_records;
+    sample->out_records = out_records;
+    mk_list_add(&sample->_head, sample_list);
+
+    fprintf(stderr, "IN_RECORDS: %"PRIu64"\nOUT_RECORDS RATE: %" PRIu64 "\nTIMESTAMP: %"PRIu64"\n", in_records, out_records, timestamp_seconds);
+
+    if (last_sample) {
+        *input_rate = (sample->in_records - last_sample->in_records) /
+            (sample->timestamp_seconds - last_sample->timestamp_seconds);
+        *output_rate = (sample->out_records - last_sample->out_records) /
+            (sample->timestamp_seconds - last_sample->timestamp_seconds);
+    }
+
+    // /* check record rate of the last 5 samples */
+    int count = 0;
+    mk_list_foreach_safe(head, tmp, sample_list) {
+        count++;
+        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
+        if (count > 3) {
+            mk_list_del(&entry->_head);
+            flb_free(entry);
+        }
+    }
+
+    fprintf(stderr, "SAMPLE COUNT: %d\n", mk_list_size(sample_list));
+}
+
+/* API: Get fluent Bit Health Status */
+static void cb_health(mk_request_t *request, void *data)
+{
+    char buf[256];
+    int status = is_healthy();
+    uint64_t input_rate, output_rate;
+
+    get_record_rate(&input_rate, &output_rate);
+
+    snprintf(buf, sizeof(buf), "input_rate: %"PRIu64"\noutput rate: %" PRIu64 "\nok\n", input_rate, output_rate);
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
@@ -414,6 +528,7 @@ int api_v1_health(struct flb_hs *hs)
 {
 
     pthread_key_create(&hs_health_key, hs_health_key_destroy);
+    pthread_key_create(&hs_throughput_key, hs_throughput_key_destroy);
 
     counter_init(hs);
     /* Create a message queue */

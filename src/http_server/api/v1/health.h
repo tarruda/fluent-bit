@@ -24,6 +24,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_http_server.h>
+#include <stdint.h>
 
 struct flb_health_check_metrics_counter {
 
@@ -62,6 +63,16 @@ struct flb_hs_hc_buf {
     int users;
     int error_count;
     int retry_failure_count;
+    struct mk_list _head;
+};
+
+/*
+ * in/out records sample at a certain timestamp.
+ */
+struct flb_hs_throughput_sample {
+    uint64_t in_records;
+    uint64_t out_records;
+    uint64_t timestamp_seconds;
     struct mk_list _head;
 };
 
