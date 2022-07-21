@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_http_server.h>
 #include <msgpack.h>
 
@@ -32,6 +33,14 @@
 #include "health.h"
 #include "metrics.h"
 #include "mk_core/mk_list.h"
+
+struct {
+    int enabled;
+    struct mk_list *input_plugins;
+    struct mk_list *output_plugins;
+    double out_in_ratio_threshold;
+    int min_failures;
+} throughput_check_config = {0};
 
 struct flb_health_check_metrics_counter *metrics_counter;
 
@@ -302,12 +311,14 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
     mk_list_add(&buf->_head, metrics_list);
 }
 
-static bool contains_str(char **items, msgpack_object_str name)
+static bool contains_str(struct mk_list *items, msgpack_object_str name)
 {
-    int i;
+    struct mk_list *head;
+    struct flb_split_entry *entry;
 
-    for (i = 0; items[i]; i++) {
-        if (!strncmp(name.ptr, items[i], name.size)) {
+    mk_list_foreach(head, items) {
+        entry = mk_list_entry(head, struct flb_split_entry, _head);
+        if (!strncmp(name.ptr, entry->value, name.size)) {
             return true;
         }
     }
@@ -315,8 +326,8 @@ static bool contains_str(char **items, msgpack_object_str name)
     return false;
 }
 
-static void get_in_out_records(char **input_plugins,
-                               char **output_plugins,
+static void get_in_out_records(struct mk_list *input_plugins,
+                               struct mk_list *output_plugins,
                                uint64_t *in_records,
                                uint64_t *out_records)
 {
@@ -419,8 +430,8 @@ static void hs_throughput_key_destroy(void *data)
     flb_free(sample_list);
 }
 
-static int is_throughput_healthy(char **input_plugins,
-                                 char **output_plugins,
+static int is_throughput_healthy(struct mk_list *input_plugins,
+                                 struct mk_list *output_plugins,
                                  int sample_count,
                                  double out_in_ratio_threshold) {
     struct flb_time tp;
@@ -439,6 +450,10 @@ static int is_throughput_healthy(char **input_plugins,
     struct flb_hs_throughput_sample *last_sample = NULL;
     bool healthy;
     bool rv;
+
+    if (!throughput_check_config.enabled) {
+        return true;
+    }
 
     sample_list = pthread_getspecific(hs_throughput_key);
     if (sample_list == NULL) {
@@ -535,13 +550,11 @@ static int is_throughput_healthy(char **input_plugins,
 /* API: Get fluent Bit Health Status */
 static void cb_health(mk_request_t *request, void *data)
 {
-    char *input_plugins[] = {"tail.0", NULL};
-    char *output_plugins[] = {"null.0", NULL};
     int status = is_healthy() &&
-                 is_throughput_healthy(input_plugins,
-                                       output_plugins,
-                                       5,
-                                       0.1);
+                 is_throughput_healthy(throughput_check_config.input_plugins,
+                                       throughput_check_config.output_plugins,
+                                       throughput_check_config.min_failures,
+                                       throughput_check_config.out_in_ratio_threshold);
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
@@ -555,9 +568,21 @@ static void cb_health(mk_request_t *request, void *data)
     }
 }
 
+static void configure_throughput_check(struct flb_config *config)
+{
+    throughput_check_config.enabled = config->hc_throughput;
+    throughput_check_config.input_plugins =
+        flb_utils_split(config->hc_throughput_input_plugins, ',', 0);
+    throughput_check_config.output_plugins =
+        flb_utils_split(config->hc_throughput_output_plugins, ',', 0);
+    throughput_check_config.out_in_ratio_threshold = config->hc_throughput_ratio_threshold;
+    throughput_check_config.min_failures = config->hc_throughput_min_failures;
+}
+
 /* Perform registration */
 int api_v1_health(struct flb_hs *hs)
 {
+    configure_throughput_check(hs->config);
 
     pthread_key_create(&hs_health_key, hs_health_key_destroy);
     pthread_key_create(&hs_throughput_key, hs_throughput_key_destroy);
