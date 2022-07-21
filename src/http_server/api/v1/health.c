@@ -459,7 +459,7 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
     if (sample_list == NULL) {
         sample_list = hs_throughput_key_create();
         if (sample_list == NULL) {
-            flb_warn("[api/v1/health throughput]: failed to create throughput key");
+            flb_warn("[api/v1/health/throughput]: failed to create throughput key");
             return true;
         }
     }
@@ -472,7 +472,7 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
                                          struct flb_hs_throughput_sample,
                                          _head);
         if (timestamp_seconds - last_sample->timestamp_seconds < 1) {
-            flb_debug("[api/v1/health throughput]: less than 1 second passed");
+            flb_debug("[api/v1/health/throughput]: less than 1 second passed");
             /* don't do anything unless at least 1 second have passed */
             return true;
         }
@@ -486,7 +486,7 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
     if (last_sample &&
         in_records == last_sample->in_records &&
         out_records == last_sample->out_records) {
-        flb_debug("[api/v1/health throughput]: no changes since last check");
+        flb_debug("[api/v1/health/throughput]: no changes since last check");
         /* don't collect another sample unless either in_records or out_records have
          * changed*/
         return true;
@@ -498,7 +498,7 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
     sample->out_records = out_records;
     mk_list_add(&sample->_head, sample_list);
 
-    flb_debug("[api/v1/health throughput]: check samples start %d %f",
+    flb_debug("[api/v1/health/throughput]: check samples start %d %f",
               sample_count,
               out_in_ratio_threshold);
     healthy = false;
@@ -520,7 +520,7 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
         out_in_ratio = (double)out_rate / (double)in_rate;
         healthy = healthy || out_in_ratio > out_in_ratio_threshold;
 
-        flb_debug("[api/v1/health throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
+        flb_debug("[api/v1/health/throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
                   out_in_ratio,
                   out_rate,
                   in_rate);
@@ -550,11 +550,11 @@ static int is_throughput_healthy(struct mk_list *input_plugins,
 /* API: Get fluent Bit Health Status */
 static void cb_health(mk_request_t *request, void *data)
 {
-    int status = is_healthy() &&
+    int status = is_healthy() && (!throughput_check_config.enabled ||
                  is_throughput_healthy(throughput_check_config.input_plugins,
                                        throughput_check_config.output_plugins,
                                        throughput_check_config.min_failures,
-                                       throughput_check_config.out_in_ratio_threshold);
+                                       throughput_check_config.out_in_ratio_threshold));
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
@@ -570,13 +570,48 @@ static void cb_health(mk_request_t *request, void *data)
 
 static void configure_throughput_check(struct flb_config *config)
 {
-    throughput_check_config.enabled = config->hc_throughput;
+    bool enabled = config->hc_throughput;
+
+    throughput_check_config.enabled = false;
+
+    if (!enabled) {
+        return;
+    }
+
+    if (!config->hc_throughput_input_plugins) {
+        flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_IN_PLUGINS " is required");
+        return;
+    }
+    if (!config->hc_throughput_output_plugins) {
+        flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_OUT_PLUGINS " is required");
+        return;
+    }
+    if (!config->hc_throughput_ratio_threshold) {
+        flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_RATIO_THRESHOLD " is required");
+        return;
+    }
+    if (!config->hc_throughput_min_failures) {
+        flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_MIN_FAILURES " is required");
+        return;
+    }
+
     throughput_check_config.input_plugins =
         flb_utils_split(config->hc_throughput_input_plugins, ',', 0);
     throughput_check_config.output_plugins =
         flb_utils_split(config->hc_throughput_output_plugins, ',', 0);
     throughput_check_config.out_in_ratio_threshold = config->hc_throughput_ratio_threshold;
     throughput_check_config.min_failures = config->hc_throughput_min_failures;
+    throughput_check_config.enabled = true;
+
+    flb_info("[api/v1/health/throughput]: configuration complete. "
+             "input plugins: %s | "
+             "output plugins: %s | "
+             "ratio threshold: %f | "
+             "min failures: %d",
+              config->hc_throughput_input_plugins,
+              config->hc_throughput_output_plugins,
+              config->hc_throughput_ratio_threshold,
+              config->hc_throughput_min_failures);
 }
 
 /* Perform registration */

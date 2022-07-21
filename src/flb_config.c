@@ -123,7 +123,7 @@ struct flb_service_config service_configs[] = {
      offsetof(struct flb_config, hc_throughput_ratio_threshold)},
 
     {FLB_CONF_STR_HC_THROUGHPUT_MIN_FAILURES,
-     FLB_CONF_TYPE_DOUBLE,
+     FLB_CONF_TYPE_INT,
      offsetof(struct flb_config, hc_throughput_min_failures)},
 #endif
     /* DNS*/
