@@ -79,7 +79,7 @@ static void hs_metrics_key_destroy(void *data)
 }
 
 /* Return the newest metrics buffer */
-struct flb_hs_buf *metrics_get_latest()
+static struct flb_hs_buf *metrics_get_latest()
 {
     struct flb_hs_buf *buf;
     struct mk_list *metrics_list;

@@ -24,7 +24,6 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_http_server.h>
-#include <stdint.h>
 
 struct flb_health_check_metrics_counter {
 

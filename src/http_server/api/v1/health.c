@@ -17,14 +17,13 @@
  *  limitations under the License.
  */
 
-#include <stdint.h>
+#include<stdio.h>
 #include <stdlib.h>
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_macros.h>
-#include <fluent-bit/flb_metrics.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_http_server.h>
 #include <msgpack.h>
@@ -55,7 +54,6 @@ struct {
 struct flb_health_check_metrics_counter *metrics_counter;
 
 pthread_key_t hs_health_key;
-pthread_key_t hs_throughput_key;
 
 static struct mk_list *hs_health_key_create()
 {
@@ -116,6 +114,10 @@ static bool contains_str(struct mk_list *items, msgpack_object_str name)
 {
     struct mk_list *head;
     struct flb_split_entry *entry;
+
+    if (!items) {
+        return false;
+    }
 
     mk_list_foreach(head, items) {
         entry = mk_list_entry(head, struct flb_split_entry, _head);
