@@ -29,10 +29,8 @@
 #include <fluent-bit/flb_http_server.h>
 #include <msgpack.h>
 
-#include "cmetrics/cmt_metric.h"
 #include "health.h"
 #include "metrics.h"
-#include "mk_core/mk_list.h"
 
 struct {
     int enabled;
@@ -40,7 +38,9 @@ struct {
     struct mk_list *output_plugins;
     double out_in_ratio_threshold;
     int min_failures;
-} throughput_check_config = {0};
+    struct mk_list *sample_list;
+    bool healthy;
+} throughput_check_state = {0};
 
 struct flb_health_check_metrics_counter *metrics_counter;
 
@@ -259,6 +259,196 @@ static int cleanup_metrics()
     return c;
 }
 
+static bool contains_str(struct mk_list *items, msgpack_object_str name)
+{
+    struct mk_list *head;
+    struct flb_split_entry *entry;
+
+    mk_list_foreach(head, items) {
+        entry = mk_list_entry(head, struct flb_split_entry, _head);
+        if (!strncmp(name.ptr, entry->value, name.size)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void read_in_out_records(char *raw_data,
+                                size_t raw_size,
+                                struct mk_list *input_plugins,
+                                struct mk_list *output_plugins,
+                                uint64_t *in_records,
+                                uint64_t *out_records)
+{
+    int i, j, m;
+    msgpack_unpacked result;
+    msgpack_object map;
+    uint64_t in_total = 0;
+    uint64_t out_total = 0;
+    size_t off = 0;
+
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, raw_data, raw_size, &off);
+    map = result.data;
+
+    for (i = 0; i < map.via.map.size; i++) {
+        msgpack_object k;
+        msgpack_object v;
+
+        /* Keys: input, output */
+        k = map.via.map.ptr[i].key;
+        v = map.via.map.ptr[i].val;
+
+        /* Iterate sub-map */
+        for (j = 0; j < v.via.map.size; j++) {
+            msgpack_object sk;
+            msgpack_object sv;
+
+            /* Keys: plugin name , values: metrics */
+            sk = v.via.map.ptr[j].key;
+            sv = v.via.map.ptr[j].val;
+
+            for (m = 0; m < sv.via.map.size; m++) {
+                msgpack_object mk;
+                msgpack_object mv;
+
+                mk = sv.via.map.ptr[m].key;
+                mv = sv.via.map.ptr[m].val;
+
+                if (!strncmp(k.via.str.ptr, "input", k.via.str.size) &&
+                    !strncmp(mk.via.str.ptr, "records", mk.via.str.size) &&
+                    contains_str(input_plugins, sk.via.str)) {
+                    in_total += mv.via.u64;
+                }
+
+                if (!strncmp(k.via.str.ptr, "output", k.via.str.size) &&
+                    !strncmp(mk.via.str.ptr, "proc_records", mk.via.str.size) &&
+                    contains_str(output_plugins, sk.via.str)) {
+                    out_total += mv.via.u64;
+                }
+            }
+        }
+    }
+
+    msgpack_unpacked_destroy(&result);
+    *in_records = in_total;
+    *out_records = out_total;
+}
+
+static int check_throughput_health(char *metrics_raw_data,
+                                   size_t metrics_raw_size,
+                                   struct mk_list *sample_list,
+                                   struct mk_list *input_plugins,
+                                   struct mk_list *output_plugins,
+                                   int sample_count,
+                                   double out_in_ratio_threshold) {
+    struct flb_time tp;
+    uint64_t timestamp_seconds;
+    uint64_t in_records;
+    uint64_t out_records;
+    uint64_t in_rate;
+    uint64_t out_rate;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    double out_in_ratio;
+    struct flb_hs_throughput_sample *entry;
+    struct flb_hs_throughput_sample *prev;
+    struct flb_hs_throughput_sample *sample;
+    struct flb_hs_throughput_sample *last_sample = NULL;
+    bool healthy;
+    bool rv;
+
+    flb_time_get(&tp);
+    timestamp_seconds = flb_time_to_nanosec(&tp) / 1000000000;
+
+    if (mk_list_is_empty(sample_list) != 0) {
+        last_sample = mk_list_entry_last(sample_list,
+                                         struct flb_hs_throughput_sample,
+                                         _head);
+        if (timestamp_seconds - last_sample->timestamp_seconds < 1) {
+            flb_debug("[api/v1/health/throughput]: less than 1 second passed");
+            /* don't do anything unless at least 1 second have passed */
+            goto check;
+        }
+    }
+
+    struct flb_hs_buf *buf;
+    buf = metrics_get_latest();
+    if (buf) {
+        read_in_out_records(buf->raw_data,
+                            buf->raw_size,
+                            input_plugins,
+                            output_plugins,
+                            &in_records,
+                            &out_records);
+    }
+
+    if (last_sample &&
+        in_records == last_sample->in_records &&
+        out_records == last_sample->out_records) {
+        flb_debug("[api/v1/health/throughput]: no changes since last check");
+        /* don't collect another sample unless either in_records or out_records have
+         * changed*/
+        goto check;
+    }
+
+    sample = flb_malloc(sizeof(struct flb_hs_throughput_sample));
+    sample->timestamp_seconds = timestamp_seconds;
+    sample->in_records = in_records;
+    sample->out_records = out_records;
+    mk_list_add(&sample->_head, sample_list);
+
+check:
+    flb_info("[api/v1/health/throughput]: check samples start %d %f",
+              sample_count,
+              out_in_ratio_threshold);
+    healthy = false;
+    mk_list_foreach_safe_r(head, tmp, sample_list) {
+        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
+        if (entry == mk_list_entry_first(sample_list,
+                                         struct flb_hs_throughput_sample,
+                                         _head)) {
+            break;
+        }
+
+        prev = mk_list_entry(entry->_head.prev,
+                             struct flb_hs_throughput_sample,
+                             _head);
+        in_rate = (entry->in_records - prev->in_records) /
+            (entry->timestamp_seconds - prev->timestamp_seconds);
+        out_rate = (entry->out_records - prev->out_records) /
+            (entry->timestamp_seconds - prev->timestamp_seconds);
+        out_in_ratio = (double)out_rate / (double)in_rate;
+        healthy = healthy || out_in_ratio > out_in_ratio_threshold;
+
+        flb_info("[api/v1/health/throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
+                  out_in_ratio,
+                  out_rate,
+                  in_rate);
+        if (healthy) {
+            break;
+        }
+    }
+
+    int count = 0;
+    mk_list_foreach_safe_r(head, tmp, sample_list) {
+        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
+        if (count == sample_count) {
+            mk_list_del(&entry->_head);
+            flb_free(entry);
+        } else {
+            count++;
+        }
+    }
+
+    rv = count < sample_count || healthy;
+    flb_info("checking throughput samples stop, result: %s",
+              rv ? "healthy" :"unhealthy");
+    return rv;
+}
+
+
 /*
  * Callback invoked every time some metrics are received through a
  * message queue channel. This function runs in a Monkey HTTP thread
@@ -302,6 +492,17 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
 
     read_metrics(data, size, &error_count, &retry_failure_count);
 
+    if (throughput_check_state.enabled) {
+        throughput_check_state.healthy =
+            check_throughput_health(data,
+                                    size,
+                                    throughput_check_state.sample_list,
+                                    throughput_check_state.input_plugins,
+                                    throughput_check_state.output_plugins,
+                                    throughput_check_state.min_failures,
+                                    throughput_check_state.out_in_ratio_threshold);
+    }
+
     metrics_counter->error_counter = error_count;
     metrics_counter->retry_failure_counter = retry_failure_count;
 
@@ -311,250 +512,10 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
     mk_list_add(&buf->_head, metrics_list);
 }
 
-static bool contains_str(struct mk_list *items, msgpack_object_str name)
-{
-    struct mk_list *head;
-    struct flb_split_entry *entry;
-
-    mk_list_foreach(head, items) {
-        entry = mk_list_entry(head, struct flb_split_entry, _head);
-        if (!strncmp(name.ptr, entry->value, name.size)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void get_in_out_records(struct mk_list *input_plugins,
-                               struct mk_list *output_plugins,
-                               uint64_t *in_records,
-                               uint64_t *out_records)
-{
-    int i, j, m;
-    struct flb_hs_buf *buf;
-    msgpack_unpacked result;
-    msgpack_object map;
-    uint64_t in_total = 0;
-    uint64_t out_total = 0;
-    size_t off = 0;
-
-    buf = metrics_get_latest();
-    if (!buf) {
-        goto end;
-    }
-
-    msgpack_unpacked_init(&result);
-    msgpack_unpack_next(&result, buf->raw_data, buf->raw_size, &off);
-    map = result.data;
-
-    for (i = 0; i < map.via.map.size; i++) {
-        msgpack_object k;
-        msgpack_object v;
-
-        /* Keys: input, output */
-        k = map.via.map.ptr[i].key;
-        v = map.via.map.ptr[i].val;
-
-        /* Iterate sub-map */
-        for (j = 0; j < v.via.map.size; j++) {
-            msgpack_object sk;
-            msgpack_object sv;
-
-            /* Keys: plugin name , values: metrics */
-            sk = v.via.map.ptr[j].key;
-            sv = v.via.map.ptr[j].val;
-
-            for (m = 0; m < sv.via.map.size; m++) {
-                msgpack_object mk;
-                msgpack_object mv;
-
-                mk = sv.via.map.ptr[m].key;
-                mv = sv.via.map.ptr[m].val;
-
-                if (!strncmp(k.via.str.ptr, "input", k.via.str.size) &&
-                    !strncmp(mk.via.str.ptr, "records", mk.via.str.size) &&
-                    contains_str(input_plugins, sk.via.str)) {
-                    in_total += mv.via.u64;
-                }
-
-                if (!strncmp(k.via.str.ptr, "output", k.via.str.size) &&
-                    !strncmp(mk.via.str.ptr, "proc_records", mk.via.str.size) &&
-                    contains_str(output_plugins, sk.via.str)) {
-                    out_total += mv.via.u64;
-                }
-            }
-        }
-    }
-
-    msgpack_unpacked_destroy(&result);
-
-end:
-    *in_records = in_total;
-    *out_records = out_total;
-}
-
-static struct mk_list *hs_throughput_key_create()
-{
-    struct mk_list *sample_list = NULL;
-
-    sample_list = flb_malloc(sizeof(struct mk_list));
-    if (!sample_list) {
-        flb_errno();
-        return NULL;
-    }
-    mk_list_init(sample_list);
-    pthread_setspecific(hs_throughput_key, sample_list);
-
-    return sample_list;
-}
-
-static void hs_throughput_key_destroy(void *data)
-{
-    struct mk_list *sample_list = (struct mk_list*)data;
-    struct mk_list *tmp;
-    struct mk_list *head;
-    struct flb_hs_throughput_sample *entry;
-
-    if (sample_list == NULL) {
-        return;
-    }
-    mk_list_foreach_safe(head, tmp, sample_list) {
-        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
-        if (entry != NULL) {
-            mk_list_del(&entry->_head);
-            flb_free(entry);
-        }
-    }
-
-    flb_free(sample_list);
-}
-
-static int is_throughput_healthy(struct mk_list *input_plugins,
-                                 struct mk_list *output_plugins,
-                                 int sample_count,
-                                 double out_in_ratio_threshold) {
-    struct flb_time tp;
-    uint64_t timestamp_seconds;
-    uint64_t in_records;
-    uint64_t out_records;
-    uint64_t in_rate;
-    uint64_t out_rate;
-    struct mk_list *sample_list;
-    struct mk_list *tmp;
-    struct mk_list *head;
-    double out_in_ratio;
-    struct flb_hs_throughput_sample *entry;
-    struct flb_hs_throughput_sample *prev;
-    struct flb_hs_throughput_sample *sample;
-    struct flb_hs_throughput_sample *last_sample = NULL;
-    bool healthy;
-    bool rv;
-
-    if (!throughput_check_config.enabled) {
-        return true;
-    }
-
-    sample_list = pthread_getspecific(hs_throughput_key);
-    if (sample_list == NULL) {
-        sample_list = hs_throughput_key_create();
-        if (sample_list == NULL) {
-            flb_warn("[api/v1/health/throughput]: failed to create throughput key");
-            return true;
-        }
-    }
-
-    flb_time_get(&tp);
-    timestamp_seconds = flb_time_to_nanosec(&tp) / 1000000000;
-
-    if (mk_list_is_empty(sample_list) != 0) {
-        last_sample = mk_list_entry_last(sample_list,
-                                         struct flb_hs_throughput_sample,
-                                         _head);
-        if (timestamp_seconds - last_sample->timestamp_seconds < 1) {
-            flb_debug("[api/v1/health/throughput]: less than 1 second passed");
-            /* don't do anything unless at least 1 second have passed */
-            return true;
-        }
-    }
-
-    get_in_out_records(input_plugins,
-                       output_plugins,
-                       &in_records,
-                       &out_records);
-
-    if (last_sample &&
-        in_records == last_sample->in_records &&
-        out_records == last_sample->out_records) {
-        flb_debug("[api/v1/health/throughput]: no changes since last check");
-        /* don't collect another sample unless either in_records or out_records have
-         * changed*/
-        return true;
-    }
-
-    sample = flb_malloc(sizeof(struct flb_hs_throughput_sample));
-    sample->timestamp_seconds = timestamp_seconds;
-    sample->in_records = in_records;
-    sample->out_records = out_records;
-    mk_list_add(&sample->_head, sample_list);
-
-    flb_debug("[api/v1/health/throughput]: check samples start %d %f",
-              sample_count,
-              out_in_ratio_threshold);
-    healthy = false;
-    mk_list_foreach_safe_r(head, tmp, sample_list) {
-        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
-        if (entry == mk_list_entry_first(sample_list,
-                                         struct flb_hs_throughput_sample,
-                                         _head)) {
-            break;
-        }
-
-        prev = mk_list_entry(entry->_head.prev,
-                             struct flb_hs_throughput_sample,
-                             _head);
-        in_rate = (entry->in_records - prev->in_records) /
-            (entry->timestamp_seconds - prev->timestamp_seconds);
-        out_rate = (entry->out_records - prev->out_records) /
-            (entry->timestamp_seconds - prev->timestamp_seconds);
-        out_in_ratio = (double)out_rate / (double)in_rate;
-        healthy = healthy || out_in_ratio > out_in_ratio_threshold;
-
-        flb_debug("[api/v1/health/throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
-                  out_in_ratio,
-                  out_rate,
-                  in_rate);
-        if (healthy) {
-            break;
-        }
-    }
-
-    int count = 0;
-    mk_list_foreach_safe_r(head, tmp, sample_list) {
-        entry = mk_list_entry(head, struct flb_hs_throughput_sample, _head);
-        if (count == sample_count) {
-            mk_list_del(&entry->_head);
-            flb_free(entry);
-        } else {
-            count++;
-        }
-    }
-
-    rv = count < sample_count || healthy;
-    flb_debug("checking throughput samples stop, result: %s",
-              rv ? "healthy" :"unhealthy");
-
-    return rv;
-}
-
 /* API: Get fluent Bit Health Status */
 static void cb_health(mk_request_t *request, void *data)
 {
-    int status = is_healthy() && (!throughput_check_config.enabled ||
-                 is_throughput_healthy(throughput_check_config.input_plugins,
-                                       throughput_check_config.output_plugins,
-                                       throughput_check_config.min_failures,
-                                       throughput_check_config.out_in_ratio_threshold));
+    int status = is_healthy() && throughput_check_state.healthy;
 
     if (status == FLB_TRUE) {
        mk_http_status(request, 200);
@@ -572,7 +533,8 @@ static void configure_throughput_check(struct flb_config *config)
 {
     bool enabled = config->hc_throughput;
 
-    throughput_check_config.enabled = false;
+    throughput_check_state.enabled = false;
+    throughput_check_state.healthy = true;
 
     if (!enabled) {
         return;
@@ -594,14 +556,21 @@ static void configure_throughput_check(struct flb_config *config)
         flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_MIN_FAILURES " is required");
         return;
     }
+    throughput_check_state.sample_list = flb_malloc(sizeof(struct mk_list));
+    if (!throughput_check_state.sample_list) {
+        flb_warn("[api/v1/health/throughput]: failed to allocate sample list");
+        flb_errno();
+        return;
+    }
 
-    throughput_check_config.input_plugins =
+    mk_list_init(throughput_check_state.sample_list);
+    throughput_check_state.input_plugins =
         flb_utils_split(config->hc_throughput_input_plugins, ',', 0);
-    throughput_check_config.output_plugins =
+    throughput_check_state.output_plugins =
         flb_utils_split(config->hc_throughput_output_plugins, ',', 0);
-    throughput_check_config.out_in_ratio_threshold = config->hc_throughput_ratio_threshold;
-    throughput_check_config.min_failures = config->hc_throughput_min_failures;
-    throughput_check_config.enabled = true;
+    throughput_check_state.out_in_ratio_threshold = config->hc_throughput_ratio_threshold;
+    throughput_check_state.min_failures = config->hc_throughput_min_failures;
+    throughput_check_state.enabled = true;
 
     flb_info("[api/v1/health/throughput]: configuration complete. "
              "input plugins: %s | "
@@ -620,7 +589,6 @@ int api_v1_health(struct flb_hs *hs)
     configure_throughput_check(hs->config);
 
     pthread_key_create(&hs_health_key, hs_health_key_destroy);
-    pthread_key_create(&hs_throughput_key, hs_throughput_key_destroy);
 
     counter_init(hs);
     /* Create a message queue */
