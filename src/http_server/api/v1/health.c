@@ -30,7 +30,16 @@
 #include <msgpack.h>
 
 #include "health.h"
-#include "metrics.h"
+
+/*
+ * in/out records sample at a certain timestamp.
+ */
+struct flb_hs_throughput_sample {
+    uint64_t in_records;
+    uint64_t out_records;
+    uint64_t timestamp_seconds;
+    struct mk_list _head;
+};
 
 struct {
     int enabled;
@@ -330,13 +339,18 @@ static int check_throughput_health(uint64_t in_records,
     }
 
     sample = flb_malloc(sizeof(struct flb_hs_throughput_sample));
+    if (!sample) {
+        flb_error("[api/v1/health/throughput]: failed to allocate sample");
+        goto check;
+    }
+
     sample->timestamp_seconds = timestamp_seconds;
     sample->in_records = in_records;
     sample->out_records = out_records;
     mk_list_add(&sample->_head, sample_list);
 
 check:
-    flb_info("[api/v1/health/throughput]: check samples start %d %f",
+    flb_debug("[api/v1/health/throughput]: check samples start %d %f",
               sample_count,
               out_in_ratio_threshold);
     healthy = false;
@@ -358,7 +372,7 @@ check:
         out_in_ratio = (double)out_rate / (double)in_rate;
         healthy = healthy || out_in_ratio > out_in_ratio_threshold;
 
-        flb_info("[api/v1/health/throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
+        flb_debug("[api/v1/health/throughput]: out: %"PRIu64" in: %"PRIu64" ratio: %f\n",
                   out_in_ratio,
                   out_rate,
                   in_rate);
@@ -379,7 +393,7 @@ check:
     }
 
     rv = count < sample_count || healthy;
-    flb_info("checking throughput samples stop, result: %s",
+    flb_debug("checking throughput samples stop, result: %s",
               rv ? "healthy" :"unhealthy");
     return rv;
 }
@@ -500,18 +514,30 @@ static void configure_throughput_check(struct flb_config *config)
         flb_warn("[api/v1/health/throughput]: " FLB_CONF_STR_HC_THROUGHPUT_MIN_FAILURES " is required");
         return;
     }
+
     throughput_check_state.sample_list = flb_malloc(sizeof(struct mk_list));
     if (!throughput_check_state.sample_list) {
-        flb_warn("[api/v1/health/throughput]: failed to allocate sample list");
+        flb_errno();
+        return;
+    }
+    mk_list_init(throughput_check_state.sample_list);
+
+    throughput_check_state.input_plugins =
+        flb_utils_split(config->hc_throughput_input_plugins, ',', 0);
+
+    if (!throughput_check_state.input_plugins) {
         flb_errno();
         return;
     }
 
-    mk_list_init(throughput_check_state.sample_list);
-    throughput_check_state.input_plugins =
-        flb_utils_split(config->hc_throughput_input_plugins, ',', 0);
     throughput_check_state.output_plugins =
         flb_utils_split(config->hc_throughput_output_plugins, ',', 0);
+
+    if (!throughput_check_state.output_plugins) {
+        flb_errno();
+        return;
+    }
+
     throughput_check_state.out_in_ratio_threshold = config->hc_throughput_ratio_threshold;
     throughput_check_state.min_failures = config->hc_throughput_min_failures;
     throughput_check_state.enabled = true;

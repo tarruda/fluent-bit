@@ -66,16 +66,6 @@ struct flb_hs_hc_buf {
     struct mk_list _head;
 };
 
-/*
- * in/out records sample at a certain timestamp.
- */
-struct flb_hs_throughput_sample {
-    uint64_t in_records;
-    uint64_t out_records;
-    uint64_t timestamp_seconds;
-    struct mk_list _head;
-};
-
 /* health endpoint*/
 int api_v1_health(struct flb_hs *hs);
 
