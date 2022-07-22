@@ -38,6 +38,7 @@ struct {
     struct mk_list *output_plugins;
     double out_in_ratio_threshold;
     int min_failures;
+
     struct mk_list *sample_list;
     bool healthy;
 } throughput_check_state = {0};
@@ -102,6 +103,21 @@ static void counter_init(struct flb_hs *hs) {
 
 }
 
+static bool contains_str(struct mk_list *items, msgpack_object_str name)
+{
+    struct mk_list *head;
+    struct flb_split_entry *entry;
+
+    mk_list_foreach(head, items) {
+        entry = mk_list_entry(head, struct flb_split_entry, _head);
+        if (!strncmp(name.ptr, entry->value, name.size)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /*
 * tell what's the current status for health check
 * One default background is that the metrics received and saved into
@@ -159,8 +175,14 @@ static int is_healthy() {
 }
 
 /* read the metrics from message queue and update the counter*/
-static void read_metrics(void *data, size_t size, int* error_count,
-                         int* retry_failure_count)
+static void read_metrics(void *data,
+                         size_t size,
+                         struct mk_list *input_plugins,
+                         struct mk_list *output_plugins,
+                         int* error_count,
+                         int* retry_failure_count,
+                         uint64_t *input_records,
+                         uint64_t *output_records)
 {
     int i;
     int j;
@@ -170,6 +192,8 @@ static void read_metrics(void *data, size_t size, int* error_count,
     size_t off = 0;
     int errors = 0;
     int retry_failure = 0;
+    uint64_t in_recs = 0;
+    uint64_t out_recs = 0;
 
     msgpack_unpacked_init(&result);
     msgpack_unpack_next(&result, data, size, &off);
@@ -182,16 +206,14 @@ static void read_metrics(void *data, size_t size, int* error_count,
         /* Keys: input, output */
         k = map.via.map.ptr[i].key;
         v = map.via.map.ptr[i].val;
-        if (k.via.str.size != sizeof("output") - 1 ||
-            strncmp(k.via.str.ptr, "output", k.via.str.size) != 0) {
 
-            continue;
-        }
         /* Iterate sub-map */
         for (j = 0; j < v.via.map.size; j++) {
+            msgpack_object sk;
             msgpack_object sv;
 
             /* Keys: plugin name , values: metrics */
+            sk = v.via.map.ptr[j].key;
             sv = v.via.map.ptr[j].val;
 
             for (m = 0; m < sv.via.map.size; m++) {
@@ -201,14 +223,23 @@ static void read_metrics(void *data, size_t size, int* error_count,
                 mk = sv.via.map.ptr[m].key;
                 mv = sv.via.map.ptr[m].val;
 
-                if (mk.via.str.size == sizeof("errors") - 1 &&
-                    strncmp(mk.via.str.ptr, "errors", mk.via.str.size) == 0) {
-                    errors += mv.via.u64;
+                if (!strncmp(k.via.str.ptr, "output", k.via.str.size)) {
+                    if (!strncmp(mk.via.str.ptr, "errors", mk.via.str.size)) {
+                        errors += mv.via.u64;
+                    }
+                    else if (!strncmp(mk.via.str.ptr, "retries_failed", mk.via.str.size)) {
+                        retry_failure += mv.via.u64;
+                    }
+                    else if (!strncmp(mk.via.str.ptr, "proc_records", mk.via.str.size) &&
+                              contains_str(output_plugins, sk.via.str)) {
+                        out_recs += mv.via.u64;
+                    }
                 }
-                else if (mk.via.str.size == sizeof("retries_failed") - 1 &&
-                    strncmp(mk.via.str.ptr, "retries_failed",
-                            mk.via.str.size) == 0) {
-                    retry_failure += mv.via.u64;
+
+                if (!strncmp(k.via.str.ptr, "input", k.via.str.size) &&
+                    !strncmp(mk.via.str.ptr, "records", mk.via.str.size) &&
+                    contains_str(input_plugins, sk.via.str)) {
+                    in_recs += mv.via.u64;
                 }
             }
         }
@@ -216,6 +247,8 @@ static void read_metrics(void *data, size_t size, int* error_count,
 
     *error_count = errors;
     *retry_failure_count = retry_failure;
+    *input_records = in_recs;
+    *output_records = out_recs;
     msgpack_unpacked_destroy(&result);
 }
 
@@ -259,94 +292,13 @@ static int cleanup_metrics()
     return c;
 }
 
-static bool contains_str(struct mk_list *items, msgpack_object_str name)
-{
-    struct mk_list *head;
-    struct flb_split_entry *entry;
-
-    mk_list_foreach(head, items) {
-        entry = mk_list_entry(head, struct flb_split_entry, _head);
-        if (!strncmp(name.ptr, entry->value, name.size)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void read_in_out_records(char *raw_data,
-                                size_t raw_size,
-                                struct mk_list *input_plugins,
-                                struct mk_list *output_plugins,
-                                uint64_t *in_records,
-                                uint64_t *out_records)
-{
-    int i, j, m;
-    msgpack_unpacked result;
-    msgpack_object map;
-    uint64_t in_total = 0;
-    uint64_t out_total = 0;
-    size_t off = 0;
-
-    msgpack_unpacked_init(&result);
-    msgpack_unpack_next(&result, raw_data, raw_size, &off);
-    map = result.data;
-
-    for (i = 0; i < map.via.map.size; i++) {
-        msgpack_object k;
-        msgpack_object v;
-
-        /* Keys: input, output */
-        k = map.via.map.ptr[i].key;
-        v = map.via.map.ptr[i].val;
-
-        /* Iterate sub-map */
-        for (j = 0; j < v.via.map.size; j++) {
-            msgpack_object sk;
-            msgpack_object sv;
-
-            /* Keys: plugin name , values: metrics */
-            sk = v.via.map.ptr[j].key;
-            sv = v.via.map.ptr[j].val;
-
-            for (m = 0; m < sv.via.map.size; m++) {
-                msgpack_object mk;
-                msgpack_object mv;
-
-                mk = sv.via.map.ptr[m].key;
-                mv = sv.via.map.ptr[m].val;
-
-                if (!strncmp(k.via.str.ptr, "input", k.via.str.size) &&
-                    !strncmp(mk.via.str.ptr, "records", mk.via.str.size) &&
-                    contains_str(input_plugins, sk.via.str)) {
-                    in_total += mv.via.u64;
-                }
-
-                if (!strncmp(k.via.str.ptr, "output", k.via.str.size) &&
-                    !strncmp(mk.via.str.ptr, "proc_records", mk.via.str.size) &&
-                    contains_str(output_plugins, sk.via.str)) {
-                    out_total += mv.via.u64;
-                }
-            }
-        }
-    }
-
-    msgpack_unpacked_destroy(&result);
-    *in_records = in_total;
-    *out_records = out_total;
-}
-
-static int check_throughput_health(char *metrics_raw_data,
-                                   size_t metrics_raw_size,
+static int check_throughput_health(uint64_t in_records,
+                                   uint64_t out_records,
                                    struct mk_list *sample_list,
-                                   struct mk_list *input_plugins,
-                                   struct mk_list *output_plugins,
                                    int sample_count,
                                    double out_in_ratio_threshold) {
     struct flb_time tp;
     uint64_t timestamp_seconds;
-    uint64_t in_records;
-    uint64_t out_records;
     uint64_t in_rate;
     uint64_t out_rate;
     struct mk_list *tmp;
@@ -366,22 +318,6 @@ static int check_throughput_health(char *metrics_raw_data,
         last_sample = mk_list_entry_last(sample_list,
                                          struct flb_hs_throughput_sample,
                                          _head);
-        if (timestamp_seconds - last_sample->timestamp_seconds < 1) {
-            flb_debug("[api/v1/health/throughput]: less than 1 second passed");
-            /* don't do anything unless at least 1 second have passed */
-            goto check;
-        }
-    }
-
-    struct flb_hs_buf *buf;
-    buf = metrics_get_latest();
-    if (buf) {
-        read_in_out_records(buf->raw_data,
-                            buf->raw_size,
-                            input_plugins,
-                            output_plugins,
-                            &in_records,
-                            &out_records);
     }
 
     if (last_sample &&
@@ -467,6 +403,8 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
     struct mk_list *metrics_list = NULL;
     int error_count = 0;
     int retry_failure_count = 0;
+    uint64_t input_records = 0;
+    uint64_t output_records = 0;
 
     metrics_list = pthread_getspecific(hs_health_key);
 
@@ -490,15 +428,21 @@ static void cb_mq_health(mk_mq_t *queue, void *data, size_t size)
 
     buf->users = 0;
 
-    read_metrics(data, size, &error_count, &retry_failure_count);
+    read_metrics(data,
+                 size,
+                 throughput_check_state.input_plugins,
+                 throughput_check_state.output_plugins,
+                 &error_count,
+                 &retry_failure_count,
+                 &input_records,
+                 &output_records);
+
 
     if (throughput_check_state.enabled) {
         throughput_check_state.healthy =
-            check_throughput_health(data,
-                                    size,
+            check_throughput_health(input_records,
+                                    output_records,
                                     throughput_check_state.sample_list,
-                                    throughput_check_state.input_plugins,
-                                    throughput_check_state.output_plugins,
                                     throughput_check_state.min_failures,
                                     throughput_check_state.out_in_ratio_threshold);
     }
